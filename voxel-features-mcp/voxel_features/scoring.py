@@ -103,26 +103,28 @@ _SPATIAL_NULL_MAX_ROWS = 2000
 # reached min_features=6 / crossbreed. 6 = min_features, so the survey blankets the
 # basin with up to 6 valid diverse founders, then predictor-lift governs at L>=6.
 _SPATIAL_SEED_POOL_TARGET = 6
+# Minimum grid fill-fraction for a layer to seed the founder pool (Approach A+B,
+# 2026-07-03). The scorer is CROSS-only: a founder must be a viable prediction
+# TARGET for later candidates. A near-empty founder (the gen-3 KZ run's 2-voxel
+# blob, fill 6.25e-6) makes cross-lift return no_scorable_targets / n_eff=0 for
+# every candidate scored against it -> the seed bootstrap's old `scored and
+# n_eff > 0` gate rejected ALL of them -> the pool froze at 1 forever. So (B) a
+# candidate also seeds on its OWN richness when it clears this floor even if
+# cross-lift cannot score it, and (A) the task-side survey gate rejects founders
+# below it. Fill-fraction (not an absolute voxel count) so the floor is
+# grid-independent: 1e-4 ~= 32 voxels of a 200x200x8 grid, 16x above the 2-voxel
+# blob, and far below any genuinely distributed layer (fill >= ~1e-3).
+_SPATIAL_MIN_FOUNDER_FILL_FRACTION = 1e-4
 _SPATIAL_REJECTION_BIC_DELTA = 1_000_000.0
-_SPATIAL_MIN_LIFT = 1e-6
+_SPATIAL_MIN_LIFT = 0.0
 # Calibrated SUCCESS bar on mean cross-layer predictor lift (2026-06-05). The
 # uncalibrated `bic_delta < 0` gate inverted the ranking: tiny low-DOF self-
 # predictive blobs admitted while richer high-DOF crossbreed children with
 # genuine cross-layer lift were rejected -> KG frozen at 7, 25 consecutive
-# crossbreed failures. _SPATIAL_MIN_LIFT (1e-6) stays the telemetry "any positive
-# lift" floor; admission now requires a MEANINGFUL lift (live: trivial blobs
-# ~0.0026 vs distributed children ~0.011-0.020). Tunable; validated offline on
-# scratch/scoring_validation. See predictor_lift_admission_decision.
-# mae>0 policy (2026-06-08): the hand-set "meaningful lift" floor (0.005) is dropped to the
-# "any positive lift" floor _SPATIAL_MIN_LIFT (1e-6) — ANY genuine positive held-out MAE
-# improvement clears stage-1 for BOTH training success and KG admission. This is the SAME bar
-# stage-1's masking_test_passed already uses, so admission and stage-1 now agree. We use 1e-6
-# (not a literal 0.0) on purpose: an exact 0.0 floor admits floating-point-noise no-ops — e.g.
-# a clone of an existing layer has lift ~1e-9 and bic_delta ~-1e-10, so a 0.0 floor would admit
-# the duplicate. Rationale for dropping the 0.005 floor: the raw-Σ BIC gate
-# (bic_delta = bic_delta_raw < 0, commit 629a2c4) now carries the parsimony/triviality job the
-# 0.005 floor was hacked in for, so the lift gate can be permissive and let BIC + the
-# task-layer near-dup gate be the quality filters. The 0.005 history is below.
+# crossbreed failures. The admission bar is now exact strict positivity: any
+# held-out MAE lift > 0 clears the lift gate, while zero and negative lift do not.
+# KG admission can still layer raw-BIC and task-level novelty/triviality gates on
+# top without changing the success/training criterion.
 _SPATIAL_ADMIT_MIN_LIFT = _SPATIAL_MIN_LIFT
 
 
@@ -2397,167 +2399,6 @@ def fit_predict_with_fallback(
         return 0.0
 
 
-def evaluate_bidirectional_prediction(
-    existing_layers: list[np.ndarray],
-    new_layer: np.ndarray,
-    layer_dtypes: list[str],
-    new_layer_dtype: str,
-    grid: 'GridSpec',
-    shape: tuple[int, int, int],
-    mask_fraction: float = 0.2,
-    min_improvement: float = 0.01
-) -> dict:
-    """
-    DEPRECATED — not on the live scoring path.
-
-    Retained for the future Approach B (ground-truth-holdout) successor; see
-    ``NSL2-geology-task/docs/design/scoring-fix-and-replay-2026-05-25.md`` §6.6.
-    The current Stage-1 gate is implemented inside ``evaluate_new_layer`` as a
-    direct MAE-delta check using ``geological_coherence_score``'s ``system_mae``
-    field. Do not call this in new code.
-
-    Test if adding a new layer improves prediction in either direction.
-
-    Stage 1 of two-stage scoring: bidirectional masked prediction test.
-    Tests both:
-    - Direction A: Can new layer improve prediction of existing layers?
-    - Direction B: Can existing layers predict the new layer well?
-    
-    Args:
-        existing_layers: List of existing layer arrays (flattened)
-        new_layer: New layer to evaluate (flattened)
-        layer_dtypes: Data types of existing layers
-        new_layer_dtype: Data type of new layer
-        grid: GridSpec for spatial information
-        shape: (nx, ny, nz) voxel grid shape
-        mask_fraction: Fraction of data to mask for testing
-        min_improvement: Minimum R² improvement to pass
-        
-    Returns:
-        dict with test results and improvement metrics
-    """
-    if not existing_layers:
-        # First layer always passes
-        return {
-            "passes_test": True,
-            "improvement": 0.0,
-            "direction": "first_layer",
-            "baseline_r2": 0.0,
-            "with_new_layer_r2": 0.0,
-            "test_samples": 0
-        }
-    
-    # Apply geological interpolation to all layers
-    interpolated_existing = []
-    for layer in existing_layers:
-        interpolated = compute_geological_interpolation(layer, grid, shape)
-        interpolated_existing.append(interpolated)
-    
-    interpolated_new = compute_geological_interpolation(new_layer, grid, shape)
-    
-    # Create spatial mask
-    mask_3d = create_spatial_mask(shape, grid, mask_fraction)
-    mask_flat = mask_3d.flatten()
-    
-    # Split data: training (not masked) vs test (masked)
-    train_mask = ~mask_flat
-    test_mask = mask_flat
-    n_test_samples = np.sum(test_mask)
-    
-    if n_test_samples < 10:  # Need minimum test samples
-        return {
-            "passes_test": False,
-            "improvement": 0.0,
-            "direction": "insufficient_samples",
-            "baseline_r2": 0.0,
-            "with_new_layer_r2": 0.0,
-            "test_samples": n_test_samples
-        }
-    
-    # Direction A: New layer helps predict existing layers
-    direction_a_improvements = []
-    
-    for target_idx, target_layer in enumerate(interpolated_existing):
-        if len(interpolated_existing) <= 1:
-            continue  # Need other layers to use as predictors
-            
-        # Baseline: predict target using other existing layers only
-        other_existing = [layer for i, layer in enumerate(interpolated_existing) if i != target_idx]
-        other_dtypes = [dt for i, dt in enumerate(layer_dtypes) if i != target_idx]
-        
-        if other_existing:
-            # Normalize layers
-            normalized_others = normalize_layers(other_existing, other_dtypes)
-            normalized_target = normalize_layers([target_layer], [layer_dtypes[target_idx]])[0]
-            
-            # Train and test baseline
-            train_X = np.column_stack([layer[train_mask] for layer in normalized_others])
-            train_y = normalized_target[train_mask]
-            test_X = np.column_stack([layer[test_mask] for layer in normalized_others])
-            test_y = normalized_target[test_mask]
-            
-            baseline_r2 = fit_predict_with_fallback(train_X, train_y, test_X, test_y, layer_dtypes[target_idx])
-            
-            # With new layer: add new layer as additional predictor
-            normalized_new = normalize_layers([interpolated_new], [new_layer_dtype])[0]
-            train_X_plus = np.column_stack([train_X, normalized_new[train_mask].reshape(-1, 1)])
-            test_X_plus = np.column_stack([test_X, normalized_new[test_mask].reshape(-1, 1)])
-            
-            with_new_r2 = fit_predict_with_fallback(train_X_plus, train_y, test_X_plus, test_y, layer_dtypes[target_idx])
-            
-            improvement = with_new_r2 - baseline_r2
-            direction_a_improvements.append(improvement)
-    
-    direction_a_improvement = np.mean(direction_a_improvements) if direction_a_improvements else 0.0
-    
-    # Direction B: Existing layers predict new layer
-    if len(interpolated_existing) >= 1:
-        # Normalize all layers
-        normalized_existing = normalize_layers(interpolated_existing, layer_dtypes)
-        normalized_new = normalize_layers([interpolated_new], [new_layer_dtype])[0]
-        
-        # Use existing layers to predict new layer
-        train_X = np.column_stack([layer[train_mask] for layer in normalized_existing])
-        train_y = normalized_new[train_mask]
-        test_X = np.column_stack([layer[test_mask] for layer in normalized_existing])
-        test_y = normalized_new[test_mask]
-        
-        direction_b_r2 = fit_predict_with_fallback(train_X, train_y, test_X, test_y, new_layer_dtype)
-    else:
-        direction_b_r2 = 0.0
-    
-    # Determine if test passes (either direction sufficient)
-    direction_a_passes = direction_a_improvement >= min_improvement
-    direction_b_passes = direction_b_r2 >= min_improvement
-    
-    passes_test = direction_a_passes or direction_b_passes
-    
-    if direction_a_passes and direction_b_passes:
-        best_direction = "both"
-        best_improvement = max(direction_a_improvement, direction_b_r2)
-    elif direction_a_passes:
-        best_direction = "new_helps_existing"
-        best_improvement = direction_a_improvement
-    elif direction_b_passes:
-        best_direction = "existing_predict_new"
-        best_improvement = direction_b_r2
-    else:
-        best_direction = "neither"
-        best_improvement = max(direction_a_improvement, direction_b_r2)
-    
-    return {
-        "passes_test": passes_test,
-        "improvement": best_improvement,
-        "direction": best_direction,
-        "direction_a_improvement": direction_a_improvement,
-        "direction_b_r2": direction_b_r2,
-        "baseline_r2": 0.0,  # For compatibility
-        "with_new_layer_r2": best_improvement,
-        "test_samples": n_test_samples,
-        "min_improvement_threshold": min_improvement
-    }
-
-
 def geological_coherence_score(
     layer_values: list[np.ndarray],
     layer_dtypes: list[str],
@@ -3173,11 +3014,22 @@ def evaluate_new_layer(
     stage1_passed = bool(score_after.get("masking_test_passed", False))
     mae_improvement = float(score_after.get("masking_test_improvement", 0.0) or 0.0)
     stage1_tolerance_used = False
+    # The seed window is meant to admit validity-passing
+    # founders WITHOUT predictor-lift (see _SPATIAL_SEED_POOL_TARGET note), but the
+    # old gate also required a scorable cross-target (score_note=="scored" and
+    # n_eff>0). On a tiny/degenerate pool cross-lift returns
+    # score_note="no_scorable_targets"/n_eff=0, so that gate froze a run
+    # at 1 (the sole pool member was a 2-voxel blob). A founder now seeds if EITHER
+    # cross-lift actually scored it (scored and n_eff>0) OR it is rich enough on its
+    # OWN (fill fraction >= floor) to be a viable future cross-target.
+
     seed_bootstrap = bool(
         len(existing_layers) < _SPATIAL_SEED_POOL_TARGET
-        and score_after.get("score_note") == "scored"
         and score_after.get("validity_passed") is True
-        and n_eff > 0
+        and (
+            (score_after.get("score_note") == "scored" and n_eff > 0)
+            or candidate_fill_fraction >= _SPATIAL_MIN_FOUNDER_FILL_FRACTION
+        )
     )
     if seed_bootstrap:
         admitted = True

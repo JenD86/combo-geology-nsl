@@ -12,18 +12,18 @@ from voxel_features import scoring
 # despite genuinely better cross-layer predictor lift. 25 consecutive crossbreed
 # failures, KG frozen at 7.
 #
-# Calibrated policy (Approach B, reviewer consensus): admission gates on the
-# cross-layer predictor lift (validity + a meaningful lift bar). bic_delta is
-# demoted to telemetry -- it must NOT veto a layer that clears the lift bar.
-_ADMIT_MIN_LIFT = 0.005
+# Current policy: admission gates on cross-layer predictor lift (validity + any
+# strictly positive lift). bic_delta is telemetry here -- task-level KG admission
+# can layer a raw-BIC gate without changing the scorer's lift decision.
+_ADMIT_MIN_LIFT = 0.0
 
 
 @pytest.mark.parametrize(
     "label, validity, lift_mean, bic_delta, expected",
     [
-        # tiny kirey blob: marginal lift, negative bic_delta. OLD rule ADMITTED
-        # (then novelty-deduped); NEW rule rejects on the lift bar.
-        ("tiny_blob_marginal_lift", True, 0.0026, -0.075, False),
+        # tiny kirey blob: marginal positive lift. Under exact >0.0 this clears
+        # the scorer's lift gate; novelty/BIC gates live outside this helper.
+        ("tiny_blob_marginal_lift", True, 0.0026, -0.075, True),
         # richest-lift crossbreed child (+0.020) but positive bic_delta.
         # OLD rule REJECTED (bic>0); NEW rule admits on lift.
         ("rich_best_lift", True, 0.020, 0.015, True),
