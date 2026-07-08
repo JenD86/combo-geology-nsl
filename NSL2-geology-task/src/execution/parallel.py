@@ -29,6 +29,12 @@ from src.parallel import (
     ThreadSafeGenerationCollector,
     WorkerSlot,
 )
+from src.task.base import (
+    SaturationDecision,
+    load_task_generation_checkpoint_state,
+    task_generation_checkpoint_state,
+    task_saturation_enabled,
+)
 from src.training_data.transforms import (
     TARGET_COUNT_BASIS,
     TrainingDataExportContext,
@@ -40,6 +46,7 @@ from src.typing.training import (
     append_episode_jsonl,
     load_generation_checkpoint,
     save_generation_checkpoint,
+    save_stop_reason_sentinel,
 )
 from src.typing.trajectory import GenerationData
 
@@ -85,6 +92,7 @@ def _save_parallel_checkpoint(
     *,
     target_training_rows: int,
     export_recipe_hash: str,
+    task: Any | None = None,
 ) -> None:
     generation_data = collector.get_generation_data()
     row_count_state = collector.row_count_state()
@@ -100,6 +108,10 @@ def _save_parallel_checkpoint(
     payload["training_row_count_last_refreshed_episode"] = (
         row_count_state.training_row_count_last_refreshed_episode
     )
+    if task is not None:
+        task_state = task_generation_checkpoint_state(task)
+        if task_state is not None:
+            payload["task_checkpoint_state"] = task_state
     save_generation_checkpoint(payload, checkpoint_path)
 
 
@@ -186,6 +198,10 @@ def _run_generation_parallel(
                 "checkpoint export recipe hash differs from current task recipe: "
                 f"{checkpoint_recipe_hash!r} != {recipe.recipe_hash!r}"
             )
+        load_task_generation_checkpoint_state(
+            rt.task,
+            checkpoint.get("task_checkpoint_state") if checkpoint else None,
+        )
         generation_data.set_training_row_count(_count_training_rows(generation_data))
 
     base_compose_dir = (
@@ -230,6 +246,10 @@ def _run_generation_parallel(
     counter_lock = threading.Lock()
     variations = rt.task.list_variations()
     variation_count = len(variations)
+    rollover_lock = threading.Lock()
+    drain_condition = threading.Condition()
+    draining = threading.Event()
+    in_flight = 0
 
     from rich.console import Console as RichConsole
 
@@ -350,6 +370,72 @@ def _run_generation_parallel(
                 collector.refresh_training_row_count()
         return collector.should_stop(target_rows)
 
+    def _begin_episode_in_flight() -> bool:
+        nonlocal in_flight
+        with drain_condition:
+            while draining.is_set() and not stop_event.is_set():
+                drain_condition.wait(timeout=0.1)
+            if stop_event.is_set():
+                return False
+            in_flight += 1
+            return True
+
+    def _finish_episode_in_flight() -> None:
+        nonlocal in_flight
+        with drain_condition:
+            in_flight = max(0, in_flight - 1)
+            if in_flight == 0:
+                drain_condition.notify_all()
+
+    def _set_draining() -> None:
+        with drain_condition:
+            draining.set()
+            drain_condition.notify_all()
+
+    def _clear_draining() -> None:
+        with drain_condition:
+            draining.clear()
+            drain_condition.notify_all()
+
+    def _wait_for_in_flight_zero() -> None:
+        with drain_condition:
+            while in_flight > 0 and not stop_event.is_set():
+                drain_condition.wait(timeout=0.1)
+
+    def _maybe_handle_saturation() -> None:
+        if stop_event.is_set():
+            return
+        if not task_saturation_enabled(rt.task):
+            return
+        outcome = rt.task.evaluate_saturation(collector.snapshot())
+        decision = getattr(outcome, "decision", SaturationDecision.CONTINUE)
+        decision_value = getattr(decision, "value", decision)
+        if decision_value == SaturationDecision.STOP.value:
+            _signal_stop(getattr(outcome, "reason", None) or "saturation_exhausted")
+            return
+        if decision_value != SaturationDecision.ROLLOVER.value:
+            return
+        if stop_event.is_set() or not rollover_lock.acquire(blocking=False):
+            return
+        try:
+            if stop_event.is_set():
+                return
+            _set_draining()
+            _wait_for_in_flight_zero()
+            if stop_event.is_set():
+                return
+            if _confirm_target_reached():
+                _signal_stop("target_reached")
+                return
+            rt.task.rollover_knowledge_graph(
+                getattr(outcome, "reason", None) or "saturation",
+                collector.snapshot(),
+                rolled_at=datetime.now().isoformat(timespec="seconds"),
+            )
+        finally:
+            _clear_draining()
+            rollover_lock.release()
+
     def worker_loop(slot: WorkerSlot) -> None:
         slot_config = rt.config.model_copy(
             update={"code_host_cache_path": str(slot.cache_dir)}
@@ -394,6 +480,9 @@ def _run_generation_parallel(
                 last_prompt_tokens=None,
             )
 
+            episode_in_flight = _begin_episode_in_flight()
+            if not episode_in_flight:
+                break
             try:
                 variation_index = select_variation_index(
                     generation_config.variation_strategy,
@@ -436,9 +525,13 @@ def _run_generation_parallel(
                                 status="tripped",
                                 cb_tripped=True,
                             )
+                        _finish_episode_in_flight()
+                        episode_in_flight = False
                         continue
                     slot.circuit_breaker.reset()
                     _display_update_slot(slot.slot_id, status="running")
+                    _finish_episode_in_flight()
+                    episode_in_flight = False
                     continue
 
                 lease = None
@@ -460,6 +553,8 @@ def _run_generation_parallel(
                         if _endpoint_capacity_floor_tripped()
                         else "endpoint_pool_unavailable"
                     )
+                    _finish_episode_in_flight()
+                    episode_in_flight = False
                     break
 
                 try:
@@ -513,6 +608,8 @@ def _run_generation_parallel(
                     slot.circuit_breaker.record_success()
 
                 collector.add_episode(episode)
+                _finish_episode_in_flight()
+                episode_in_flight = False
                 if episode.success:
                     slot_successes += len(episode.prompt_responses)
                 _display_update_slot(slot.slot_id, successes=slot_successes)
@@ -521,6 +618,8 @@ def _run_generation_parallel(
 
                 if _confirm_target_reached():
                     _signal_stop("target_reached")
+                else:
+                    _maybe_handle_saturation()
                 if generation_config.checkpoint_every_episode:
                     with file_lock:
                         append_episode_jsonl(episode.to_dict(), all_episodes_path)
@@ -530,6 +629,7 @@ def _run_generation_parallel(
                             rt.run_id,
                             target_training_rows=target_rows,
                             export_recipe_hash=recipe.recipe_hash,
+                            task=rt.task,
                         )
 
                 slot_episodes_since_rebuild += 1
@@ -570,6 +670,9 @@ def _run_generation_parallel(
                         slot.slot_id, status="running", cb_tripped=False
                     )
             except Exception:
+                if episode_in_flight:
+                    _finish_episode_in_flight()
+                    episode_in_flight = False
                 logger.exception(
                     f"Slot {slot.slot_id} episode {episode_index}: unhandled exception"
                 )
@@ -693,6 +796,19 @@ def _run_generation_parallel(
                 else "force_stop"
                 if global_circuit.is_tripped()
                 else "max_episodes"
+            )
+            if result.termination_reason == "saturation_exhausted":
+                save_stop_reason_sentinel(
+                    result.termination_reason,
+                    generation_dir / "STOP_REASON",
+                )
+            _save_parallel_checkpoint(
+                collector,
+                checkpoint_path,
+                rt.run_id,
+                target_training_rows=target_rows,
+                export_recipe_hash=recipe.recipe_hash,
+                task=rt.task,
             )
         finally:
             try:

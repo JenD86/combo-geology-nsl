@@ -113,10 +113,12 @@ def _multi_point_fallback(scratch_dir: Path, layer_name: str) -> None:
         )
 
 
-def _array_layer(scratch_dir: Path, layer_name: str, *, with_provenance: bool) -> None:
+def _array_layer(
+    scratch_dir: Path, layer_name: str, *, with_provenance: bool, fill: float = 0.5
+) -> None:
     store = SpatialVoxelStore(scratch_dir, _grid())
     values = np.zeros(_grid().shape, dtype=float)
-    values[:, :, :] = 0.5
+    values[:, :, :] = fill
     if with_provenance:
         store.set_layer_array(
             layer_name,
@@ -272,6 +274,33 @@ def test_artifact_backed_array_first_root_admits(tmp_path: Path) -> None:
     assert record["geometry_kind_counts"] == {"array": 1}
     assert record["single_spatial_operation"] is False
     assert (kg_dir / "experiments.jsonl").exists()
+
+
+def test_empty_array_op_first_root_rejected(tmp_path: Path) -> None:
+    # Regression (2026-06-26 gen-2 DFT run): an artifact-backed set_layer_array
+    # that materialized an ALL-ZERO grid (op_count=1, array op, zero nonzero
+    # voxels — the value-column-string-skip degenerate mode) carries no signal
+    # yet slipped EVERY guard and was admitted first_layer_auto as kg_evidence,
+    # polluting the pool. declared_nothing only catches op_count==0, and
+    # single_spatial_operation excludes array ops, so the emptiness gate must
+    # reject a materialized zero-voxel layer regardless of op_count, on every
+    # admission path (this drives the survey/first_layer_auto path).
+    task = _task(tmp_path)
+    kg_dir = tmp_path / "kg"
+    store_dir = tmp_path / "store"
+    layer_name = "empty_array_root"
+    _array_layer(store_dir / "scratch" / layer_name, layer_name, with_provenance=True, fill=0.0)
+    record = _first_root_record("exp_empty_array", layer_name)
+
+    admitted = _admit(task, kg_dir, store_dir, layer_name, record)
+
+    assert admitted is False
+    assert record["admission_tier"] == "guard_rejected"
+    assert record["emptiness_rejection_reason"] == "degenerate_empty_layer"
+    # NOT declared_nothing — it ran an op, it just produced nothing.
+    assert record["declared_nothing"] is False
+    assert not (kg_dir / "experiments.jsonl").exists()
+    assert not (store_dir / "admitted" / "layers" / f"{layer_name}.npy").exists()
 
 
 def test_array_without_operation_provenance_rejected(tmp_path: Path) -> None:

@@ -10,9 +10,11 @@ behind orchestrator-mode, ReAct, tool-calling, or external-container
 harnesses.
 """
 
+import enum
 import inspect
 from abc import ABC, abstractmethod
 from collections.abc import Sequence
+from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Generic, TypeVar
 
 from docker.models.containers import Container
@@ -34,6 +36,7 @@ from src.task.types import (
 
 if TYPE_CHECKING:
     from src.training_data.transforms import TrainingDataTransform
+    from src.typing.trajectory import GenerationData
 
 StateT = TypeVar("StateT")
 
@@ -68,6 +71,51 @@ class TaskEnvironmentError(Exception):
     ) -> None:
         super().__init__(message)
         self.container_ids: list[str] = container_ids or []
+
+
+class SaturationDecision(enum.Enum):
+    CONTINUE = "continue"
+    ROLLOVER = "rollover"
+    STOP = "stop"
+
+
+@dataclass(frozen=True)
+class SaturationOutcome:
+    decision: SaturationDecision
+    reason: str | None = None
+
+
+def task_saturation_enabled(task: Any) -> bool:
+    checker = getattr(task, "saturation_enabled", None)
+    if callable(checker):
+        enabled = checker()
+        if isinstance(enabled, bool):
+            return enabled
+    raw_enabled = getattr(task, "_saturation_enabled", None)
+    if isinstance(raw_enabled, bool):
+        return raw_enabled
+    return True
+
+
+def task_generation_checkpoint_state(task: Any) -> dict[str, Any] | None:
+    state_fn = getattr(task, "generation_checkpoint_state", None)
+    if not callable(state_fn):
+        return None
+    state = state_fn()
+    if isinstance(state, dict) and state:
+        return dict(state)
+    return None
+
+
+def load_task_generation_checkpoint_state(
+    task: Any,
+    state: Any,
+) -> None:
+    if not isinstance(state, dict):
+        return
+    load_fn = getattr(task, "load_generation_checkpoint_state", None)
+    if callable(load_fn):
+        load_fn(state)
 
 
 class TaskSpec(ABC, Generic[StateT]):
@@ -326,6 +374,48 @@ class TaskSpec(ABC, Generic[StateT]):
             containers, episode_context, artifacts, private_context=private_context
         )
         return self.compute_reward(initial, final, artifacts)
+
+    # --- Run-level saturation policy ---
+
+    def saturation_enabled(self) -> bool:
+        """Return whether run-level saturation evaluation should be called."""
+        return False
+
+    def evaluate_saturation(
+        self,
+        generation_data: "GenerationData",
+    ) -> SaturationOutcome:
+        """Return task-owned run-saturation policy decision.
+
+        Default is opt-out. Tasks that own a resettable long-lived store can
+        override this and return ROLLOVER or STOP; the execution loop remains
+        task-agnostic and only acts on the returned decision.
+        """
+        del generation_data
+        return SaturationOutcome(SaturationDecision.CONTINUE)
+
+    def rollover_knowledge_graph(
+        self,
+        reason_tag: str,
+        generation_data: "GenerationData",
+        *,
+        rolled_at: str | None = None,
+    ) -> None:
+        """Reset task-owned KG state after the execution loop has drained."""
+        del reason_tag, generation_data, rolled_at
+        return None
+
+    def generation_checkpoint_state(self) -> dict[str, Any] | None:
+        """Return task-owned state to persist in generation checkpoints."""
+        return None
+
+    def load_generation_checkpoint_state(
+        self,
+        state: dict[str, Any] | None,
+    ) -> None:
+        """Restore task-owned state from a generation checkpoint."""
+        del state
+        return None
 
     # --- Validation ---
 

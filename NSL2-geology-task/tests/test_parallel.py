@@ -335,6 +335,19 @@ class TestThreadSafeGenerationCollector(unittest.TestCase):
         data = collector.get_generation_data()
         self.assertEqual(data.total_episodes_run, 1)
 
+    def test_snapshot_returns_consistent_copy(self):
+        from src.parallel import ThreadSafeGenerationCollector
+
+        collector = ThreadSafeGenerationCollector(GenerationData(generation_id=0))
+        collector.add_episode(_make_episode(episode_id="ep-0", episode_index=0))
+
+        snapshot = collector.snapshot()
+        collector.add_episode(_make_episode(episode_id="ep-1", episode_index=1))
+
+        self.assertEqual(snapshot.total_episodes_run, 1)
+        self.assertEqual(len(snapshot.all_episodes), 1)
+        self.assertEqual(collector.training_row_count(), 2)
+
 
 class TestWorkerSlot(unittest.TestCase):
     def test_unique_slot_ids(self):

@@ -218,6 +218,23 @@ class TestPromptParity:
         assert "au_ppm" in text
         assert "multi-element assay" in text
 
+    def test_prompts_do_not_preselect_a_target_element(self) -> None:
+        """No prompt surface may pre-bless gold (or any single element) as THE
+        selected/target element — that primes the agent toward gold hypotheses.
+
+        The raw ``selected_element`` CSV column is intentionally left in the data;
+        only the prompt surface (dataset overview + coding-phase data spec) is
+        neutralized. Examples must also span beyond the gold + pathfinder suite.
+        """
+        overview = m._DATASET_OVERVIEW
+        assert "selected_element" not in overview
+        assert "ni_ppm" in overview  # a base-metal example, not a gold pathfinder
+
+        task = FeatureHypothesisAustraliaTask.__new__(FeatureHypothesisAustraliaTask)
+        spec_text = json.dumps(task._enhance_data_spec({"files": []}), sort_keys=True)
+        assert "selected_element" not in spec_text
+        assert "ni_ppm" in spec_text
+
 
 class TestSftIdentity:
     def test_proposer_rows_tag_is_australia_and_distinct(self) -> None:
@@ -326,6 +343,23 @@ class TestDegenerateFillGate:
         assert ok is True
         assert kg["first_root_rejection_reason"] == "none"
 
+    def test_low_voxel_founder_rejected_in_survey(self) -> None:
+        # gen3-kz deadlock parity (2026-07-03): a near-empty founder (nonzero but
+        # far below the min-founder-voxel floor) is not a viable cross-lift target.
+        # degenerate_empty only catches fill==0 and degenerate_fill only the
+        # full-constant blob, so this LOW-but-nonzero case needs its own floor.
+        import numpy as np
+
+        blob2 = np.zeros((200, 200, 8), dtype=float)
+        blob2[100, 100, 0] = 1.0
+        blob2[100, 101, 0] = 1.0  # 2 nonzero voxels
+        kg = self._kg_record_for(blob2)
+        assert kg["candidate_nonzero_voxels"] == 2
+        assert kg["candidate_fill_fraction"] > 0.0  # not caught by degenerate_empty
+        ok = FeatureHypothesisAustraliaTask._seed_phase_admission_ok(kg, seed_phase=True)
+        assert ok is False
+        assert kg["first_root_rejection_reason"] == "degenerate_low_voxel_founder"
+
     def test_full_continuous_field_admitted_in_survey(self) -> None:
         import numpy as np
 
@@ -369,3 +403,61 @@ class TestDegenerateFillGate:
         kg = self._kg_record_for(empty)
         ok = FeatureHypothesisAustraliaTask._seed_phase_admission_ok(kg, seed_phase=False)
         assert ok is True
+
+
+class TestEmptinessVerdict:
+    """Ported from the Kazakhstan zero-voxel fix (2026-06-26): the emptiness gate
+    must reject a materialized all-zero layer that ran an op (op_count>0) on EVERY
+    admission path, not only in the survey seed floor.
+
+    Australia already rejects a survey-phase empty seed via _seed_phase_admission_ok
+    (``degenerate_empty``), but that floor is a no-op in crossbreed (the scorer
+    governs). _stamp_candidate_triviality is the single source of truth for the
+    emptiness verdict (``emptiness_rejection_reason``), which check_guards/
+    ``emptiness_passed`` reads on every path — mirroring the KZ check_guards wiring
+    (test_first_root_hardening_integration.py::test_empty_array_op_first_root_rejected).
+
+    NOTE: the ``degenerate_fill`` (full-constant blob) seed-floor check is
+    DELIBERATELY Australia-only and is NOT ported to KZ — KZ keeps that slack for
+    its lower-quality dataset. Only the EMPTINESS verdict is shared across tasks.
+    """
+
+    @staticmethod
+    def _kg(op_count: int, geometry_kind_counts: dict | None = None) -> dict:
+        return {
+            "spatial_operation_provenance_count": op_count,
+            "coordinate_source_counts": {"artifact": op_count} if op_count else {},
+            "geometry_kind_counts": geometry_kind_counts or {},
+        }
+
+    def test_empty_array_op_layer_is_degenerate_empty(self) -> None:
+        import numpy as np
+
+        kg = self._kg(1, {"array": 1})
+        kg["candidate_nonzero_voxels"] = 99  # stale scorer telemetry must not win
+        FeatureHypothesisAustraliaTask._stamp_candidate_triviality(
+            kg, values=np.zeros((4, 4, 2), dtype=float)
+        )
+        assert kg["candidate_nonzero_voxels"] == 0
+        assert kg["emptiness_rejection_reason"] == "degenerate_empty_layer"
+        assert kg["declared_nothing"] is False  # ran an op → not declared_nothing
+
+    def test_declared_nothing_preserved(self) -> None:
+        import numpy as np
+
+        kg = self._kg(0)
+        FeatureHypothesisAustraliaTask._stamp_candidate_triviality(
+            kg, values=np.zeros((4, 4, 2), dtype=float)
+        )
+        assert kg["declared_nothing"] is True
+        assert kg["emptiness_rejection_reason"] == "declared_nothing"
+
+    def test_nonempty_array_op_layer_passes_emptiness(self) -> None:
+        import numpy as np
+
+        kg = self._kg(1, {"array": 1})
+        values = np.zeros((4, 4, 2), dtype=float)
+        values[1:3, 1:3, 0] = 0.7
+        FeatureHypothesisAustraliaTask._stamp_candidate_triviality(kg, values=values)
+        assert kg["emptiness_rejection_reason"] == "none"
+        assert kg["declared_nothing"] is False

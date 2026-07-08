@@ -18,7 +18,13 @@ from src.container import (
 )
 from src.execution.backend_runtime import BackendRuntime
 from src.execution.episode_runner import run_single_episode
-from src.task.base import TaskEnvironmentError
+from src.task.base import (
+    SaturationDecision,
+    TaskEnvironmentError,
+    load_task_generation_checkpoint_state,
+    task_generation_checkpoint_state,
+    task_saturation_enabled,
+)
 from src.training_data.transforms import (
     TARGET_COUNT_BASIS,
     TrainingDataExportContext,
@@ -32,6 +38,7 @@ from src.typing.training import (
     append_episode_jsonl,
     load_generation_checkpoint,
     save_generation_checkpoint,
+    save_stop_reason_sentinel,
 )
 from src.typing.trajectory import EpisodeTrajectory, GenerationData
 
@@ -192,6 +199,7 @@ def _build_checkpoint_payload(
     *,
     target_training_rows: int,
     export_recipe_hash: str,
+    task: Any | None = None,
 ) -> dict[str, Any]:
     payload = generation_data.to_metadata_dict(run_id=run_id)
     payload["next_episode_index"] = next_episode_index
@@ -199,6 +207,10 @@ def _build_checkpoint_payload(
     payload["target_training_rows"] = target_training_rows
     payload["export_recipe_hash"] = export_recipe_hash
     payload["training_row_count"] = generation_data.training_row_count
+    if task is not None:
+        task_state = task_generation_checkpoint_state(task)
+        if task_state is not None:
+            payload["task_checkpoint_state"] = task_state
     return payload
 
 
@@ -246,6 +258,10 @@ def run_generation_sequential(
                     f"recipe: {checkpoint_recipe_hash!r} != {recipe.recipe_hash!r}"
                 )
             start_episode_index = int(checkpoint.get("next_episode_index", 0))
+            load_task_generation_checkpoint_state(
+                rt.task,
+                checkpoint.get("task_checkpoint_state"),
+            )
             generation_data = _load_existing_generation_data(
                 all_episodes_path, generation_id
             )
@@ -336,6 +352,17 @@ def run_generation_sequential(
         if not has_admission:
             return bootstrap_episodes_run >= max_bootstrap_count
         return regular_episodes_run >= max_episode_count
+
+    def _confirm_target_reached() -> bool:
+        if generation_data.training_row_count < target_training_rows:
+            return False
+        if not generation_data.training_row_count_is_exact:
+            _refresh_training_row_count(
+                generation_data,
+                transforms,
+                export_context,
+            )
+        return generation_data.training_row_count >= target_training_rows
 
     try:
         while not _budget_exhausted():
@@ -489,6 +516,14 @@ def run_generation_sequential(
                     export_context,
                 )
 
+            target_reached_after_episode = _confirm_target_reached()
+            saturation_outcome = None
+            if (
+                not target_reached_after_episode
+                and task_saturation_enabled(rt.task)
+            ):
+                saturation_outcome = rt.task.evaluate_saturation(generation_data)
+
             episode_progress.update(1)
             rows_progress.update(generation_data.training_row_count - previous_rows)
             elapsed_hours = (time.perf_counter() - generation_started_at) / 3600
@@ -523,9 +558,49 @@ def run_generation_sequential(
                         rt.run_id,
                         target_training_rows=target_training_rows,
                         export_recipe_hash=recipe.recipe_hash,
+                        task=rt.task,
                     ),
                     checkpoint_path,
                 )
+
+            if target_reached_after_episode:
+                generation_data.termination_reason = "target_reached"
+                break
+
+            saturation_decision = getattr(
+                saturation_outcome,
+                "decision",
+                SaturationDecision.CONTINUE,
+            )
+            saturation_decision_value = getattr(
+                saturation_decision,
+                "value",
+                saturation_decision,
+            )
+            if saturation_decision_value == SaturationDecision.STOP.value:
+                generation_data.termination_reason = (
+                    getattr(saturation_outcome, "reason", None)
+                    or "saturation_exhausted"
+                )
+                break
+            if saturation_decision_value == SaturationDecision.ROLLOVER.value:
+                rt.task.rollover_knowledge_graph(
+                    getattr(saturation_outcome, "reason", None) or "saturation",
+                    generation_data,
+                    rolled_at=datetime.now().isoformat(timespec="seconds"),
+                )
+                if generation_config.checkpoint_every_episode:
+                    save_generation_checkpoint(
+                        _build_checkpoint_payload(
+                            generation_data,
+                            episode_index + 1,
+                            rt.run_id,
+                            target_training_rows=target_training_rows,
+                            export_recipe_hash=recipe.recipe_hash,
+                            task=rt.task,
+                        ),
+                        checkpoint_path,
+                    )
 
             completed_episodes = episode_index + 1
             if max_bootstrap_count is None:
@@ -580,6 +655,22 @@ def run_generation_sequential(
             generation_data.termination_reason = "max_episodes"
 
     generation_data.completed_at = datetime.now().isoformat()
+    if generation_data.termination_reason == "saturation_exhausted":
+        save_stop_reason_sentinel(
+            generation_data.termination_reason,
+            generation_dir / "STOP_REASON",
+        )
+        save_generation_checkpoint(
+            _build_checkpoint_payload(
+                generation_data,
+                generation_data.total_episodes_run,
+                rt.run_id,
+                target_training_rows=target_training_rows,
+                export_recipe_hash=recipe.recipe_hash,
+                task=rt.task,
+            ),
+            checkpoint_path,
+        )
     return generation_data
 
 
@@ -645,6 +736,7 @@ def save_generation_data(
             run_id,
             target_training_rows=generation_data.training_row_count,
             export_recipe_hash=recipe.recipe_hash,
+            task=task,
         ),
         generation_dir / "checkpoint.json",
     )

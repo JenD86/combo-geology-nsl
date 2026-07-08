@@ -142,6 +142,13 @@ class TestDefaultMethods:
         task = StubTask({})
         assert task.workflow(Variation("v1", "test"), {}) is None
 
+    def test_saturation_defaults_are_noop(self):
+        task = StubTask({})
+
+        assert task.saturation_enabled() is False
+        assert task.generation_checkpoint_state() is None
+        task.load_generation_checkpoint_state({"anything": "ignored"})
+
     def test_system_prompt_method_is_not_added(self):
         task = StubTask({})
         assert not hasattr(task, "system_prompt")

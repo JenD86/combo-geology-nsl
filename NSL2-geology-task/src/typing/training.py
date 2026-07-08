@@ -71,6 +71,20 @@ def save_generation_checkpoint(
             temp_path.unlink()
 
 
+def save_stop_reason_sentinel(reason: str, output_path: Path) -> None:
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    temp_path = output_path.with_name(
+        f".{output_path.name}.{os.getpid()}.{uuid.uuid4().hex}.tmp"
+    )
+    try:
+        with open(temp_path, "w", encoding="utf-8") as handle:
+            handle.write(reason)
+        temp_path.replace(output_path)
+    finally:
+        if temp_path.exists():
+            temp_path.unlink()
+
+
 def load_generation_checkpoint(output_path: Path) -> dict[str, Any] | None:
     if not output_path.exists():
         return None

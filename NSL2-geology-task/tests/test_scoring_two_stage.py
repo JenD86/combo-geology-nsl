@@ -124,6 +124,31 @@ def test_seed_bootstrap_extends_to_diverse_founder_pool(tmp_path: Path) -> None:
     assert result["admitted"] is True
 
 
+def test_diverse_seed_bootstraps_over_degenerate_founder(tmp_path: Path) -> None:
+    """Approach B (gen3-kz deadlock, 2026-07-03): a degenerate near-empty founder
+    yields n_effective_samples=0 for cross-lift, which froze the gen-3 KZ run — the
+    only pool member was a 2-voxel blob, so every subsequent candidate scored
+    n_eff=0 -> the old ``seed_bootstrap and n_eff > 0`` gate rejected ALL of them
+    -> pool stuck at 1 forever. The seed window now also admits a candidate on its
+    OWN richness (>= _SPATIAL_MIN_FOUNDER_VOXELS nonzero voxels) so the founder
+    pool grows even when the current pool cannot serve as a cross-lift target.
+    """
+    store = _store(tmp_path / "degenerate_founder")
+    degenerate = np.zeros(_GRID.shape, dtype=np.float32)
+    degenerate[20, 20, 0] = 1.0
+    degenerate[20, 21, 0] = 1.0  # 2 nonzero voxels — the gen-3 poison founder
+    store.add_layer("degenerate_founder", degenerate, dtype="float")
+
+    # A substantial candidate (>> _SPATIAL_MIN_FOUNDER_VOXELS voxels).
+    result = evaluate_new_layer(store, "substantial", _blob((24, 20), radius=3), "float", seed=7)
+
+    # cross-lift cannot score against a 2-voxel pool ...
+    assert result["n_effective_samples"] == 0
+    # ... but the candidate is admitted on self-richness so the pool can grow.
+    assert result["admission_path"] == "diverse_seed"
+    assert result["admitted"] is True
+
+
 def test_spatial_predictor_lift_admits_non_colocated_candidate(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

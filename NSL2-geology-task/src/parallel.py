@@ -162,6 +162,10 @@ class ThreadSafeGenerationCollector:
             failed_episodes=list(self._generation_data.failed_episodes),
         )
 
+    def snapshot(self) -> GenerationData:
+        with self._lock:
+            return self._snapshot_generation_data_locked()
+
     def add_episode(self, episode: EpisodeTrajectory) -> None:
         with self._lock:
             self._generation_data.add_episode(episode)

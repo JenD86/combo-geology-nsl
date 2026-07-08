@@ -1,6 +1,7 @@
 import json
 import random
 import threading
+import time
 import unittest
 from contextlib import nullcontext
 from pathlib import Path
@@ -18,7 +19,7 @@ from src.execution.generation import (
 from src.execution.parallel import run_generation_parallel
 from src.observability.types import InferenceMetric, UsageInfo
 from src.parallel import SlotCircuitBreaker, StopReason, WorkerSlot
-from src.task.base import TaskEnvironmentError
+from src.task.base import SaturationDecision, SaturationOutcome, TaskEnvironmentError
 from src.task.types import PopulationOutcome, PopulationResult, TaskReward
 from src.training_data.transforms import build_export_recipe
 from src.typing.config import AppConfig
@@ -47,6 +48,10 @@ class GenerationOrchestratorTests(unittest.TestCase):
         task.agent_service_name = base_task.agent_service_name
         task.name = base_task.name
         task.training_data_transforms.return_value = ()
+        task.evaluate_saturation.return_value = SaturationOutcome(
+            SaturationDecision.CONTINUE
+        )
+        task.rollover_knowledge_graph.return_value = None
         return task
 
     def make_config(self, base_dir: Path, **generation_overrides: object) -> AppConfig:
@@ -1525,6 +1530,187 @@ class GenerationOrchestratorTests(unittest.TestCase):
         self.assertEqual(run_single_episode_mock.call_count, 3)
         self.assertEqual(generation_data.total_episodes_run, 3)
 
+    def test_target_reached_precedes_saturation(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(
+                base_dir,
+                target_training_rows=1,
+                max_episodes=5,
+            )
+            task = self.make_task()
+            task.evaluate_saturation.return_value = SaturationOutcome(
+                SaturationDecision.ROLLOVER,
+                "test saturation",
+            )
+            with (
+                patch("src.execution.generation.ContainerManager") as ContainerManager,
+                patch(
+                    "src.execution.generation.run_single_episode"
+                ) as run_single_episode_mock,
+            ):
+                manager = ContainerManager.return_value
+                self.configure_manager_mock(manager)
+                run_single_episode_mock.return_value = self.make_episode(
+                    0,
+                    row_count=1,
+                    success=True,
+                )
+
+                generation_data = run_generation(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                    task=task,
+                )
+
+        self.assertEqual(generation_data.termination_reason, "target_reached")
+        task.rollover_knowledge_graph.assert_not_called()
+
+    def test_saturation_exhausted_writes_sentinel_and_checkpoint(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(
+                base_dir,
+                target_training_rows=100,
+                max_episodes=1,
+                checkpoint_every_episode=False,
+            )
+            task = self.make_task()
+            task.evaluate_saturation.return_value = SaturationOutcome(
+                SaturationDecision.STOP,
+                "saturation_exhausted",
+            )
+            with (
+                patch("src.execution.generation.ContainerManager") as ContainerManager,
+                patch(
+                    "src.execution.generation.run_single_episode"
+                ) as run_single_episode_mock,
+            ):
+                manager = ContainerManager.return_value
+                self.configure_manager_mock(manager)
+                run_single_episode_mock.return_value = self.make_episode(
+                    0,
+                    row_count=0,
+                    success=False,
+                    score=0.0,
+                )
+
+                generation_data = run_generation(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                    task=task,
+                )
+
+            generation_dir = base_dir / "generations" / "generation_0"
+            sentinel = generation_dir / "STOP_REASON"
+            sentinel_text = sentinel.read_text(encoding="utf-8")
+            checkpoint = json.loads(
+                (generation_dir / "checkpoint.json").read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(generation_data.termination_reason, "saturation_exhausted")
+        self.assertEqual(sentinel_text, "saturation_exhausted")
+        self.assertEqual(checkpoint["termination_reason"], "saturation_exhausted")
+
+    def test_run_climbs_across_rollover(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(
+                base_dir,
+                target_training_rows=1,
+                max_episodes=2,
+            )
+            task = self.make_task()
+            task.evaluate_saturation.return_value = SaturationOutcome(
+                SaturationDecision.ROLLOVER,
+                "test saturation",
+            )
+            with (
+                patch("src.execution.generation.ContainerManager") as ContainerManager,
+                patch(
+                    "src.execution.generation.run_single_episode"
+                ) as run_single_episode_mock,
+            ):
+                manager = ContainerManager.return_value
+                self.configure_manager_mock(manager)
+                run_single_episode_mock.side_effect = [
+                    self.make_episode(0, row_count=0, success=False, score=0.0),
+                    self.make_episode(1, row_count=1, success=True),
+                ]
+
+                generation_data = run_generation(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                    task=task,
+                )
+
+        task.rollover_knowledge_graph.assert_called_once()
+        self.assertEqual(generation_data.training_row_count, 1)
+        self.assertEqual(generation_data.termination_reason, "target_reached")
+
+    def test_rollover_checkpoint_includes_updated_task_state(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            config = self.make_config(
+                base_dir,
+                target_training_rows=100,
+                max_episodes=1,
+                checkpoint_every_episode=True,
+            )
+            task = self.make_task()
+            before_state = {"saturation_epoch_start_count": 0}
+            after_state = {"saturation_epoch_start_count": 1}
+            task.generation_checkpoint_state.return_value = before_state
+            task.evaluate_saturation.return_value = SaturationOutcome(
+                SaturationDecision.ROLLOVER,
+                "test saturation",
+            )
+
+            def rollover(*_args: object, **_kwargs: object) -> None:
+                task.generation_checkpoint_state.return_value = after_state
+
+            task.rollover_knowledge_graph.side_effect = rollover
+            with (
+                patch("src.execution.generation.ContainerManager") as ContainerManager,
+                patch(
+                    "src.execution.generation.run_single_episode"
+                ) as run_single_episode_mock,
+            ):
+                manager = ContainerManager.return_value
+                self.configure_manager_mock(manager)
+                run_single_episode_mock.return_value = self.make_episode(
+                    0,
+                    row_count=0,
+                    success=False,
+                    score=0.0,
+                )
+
+                run_generation(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                    task=task,
+                )
+
+            checkpoint = json.loads(
+                (
+                    base_dir / "generations" / "generation_0" / "checkpoint.json"
+                ).read_text(encoding="utf-8")
+            )
+
+        self.assertEqual(checkpoint["task_checkpoint_state"], after_state)
+
     def test_circuit_breaker_resets_on_successful_episode(self) -> None:
         with TemporaryDirectory() as temp_dir:
             base_dir = Path(temp_dir)
@@ -2314,6 +2500,146 @@ class GenerationOrchestratorTests(unittest.TestCase):
         self.assertEqual(result.total_episodes_run, 1)
         self.assertEqual(observed_endpoint_ids, ["ep0"])
         self.assertEqual(pool.total_in_flight(), 0)
+
+    def test_parallel_rollover_waits_for_in_flight_episode(self) -> None:
+        slow_started = threading.Event()
+        slow_finished = threading.Event()
+        rollover_observed_slow_finished: list[bool] = []
+
+        def fake_run_single_episode(*args: object, **kwargs: object) -> EpisodeTrajectory:
+            episode_index = int(kwargs["episode_index"])
+            if episode_index == 0:
+                slow_started.set()
+                time.sleep(0.2)
+                slow_finished.set()
+            else:
+                slow_started.wait(timeout=1.0)
+            return self.make_episode(
+                episode_index,
+                row_count=0,
+                success=False,
+                score=0.0,
+            )
+
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            (base_dir / "compose").mkdir()
+            config = self.make_config(
+                base_dir,
+                parallel_episodes=2,
+                target_training_rows=100,
+                max_episodes=3,
+            )
+            task = self.make_task()
+
+            def evaluate_saturation(data: GenerationData) -> SaturationOutcome:
+                if rollover_observed_slow_finished:
+                    return SaturationOutcome(SaturationDecision.CONTINUE)
+                if data.total_episodes_run >= 1:
+                    return SaturationOutcome(
+                        SaturationDecision.ROLLOVER,
+                        "test saturation",
+                    )
+                return SaturationOutcome(SaturationDecision.CONTINUE)
+
+            def rollover_knowledge_graph(*_args: object, **_kwargs: object) -> None:
+                rollover_observed_slow_finished.append(slow_finished.is_set())
+
+            task.evaluate_saturation.side_effect = evaluate_saturation
+            task.rollover_knowledge_graph.side_effect = rollover_knowledge_graph
+            slots: list[WorkerSlot] = []
+            for slot_id in range(2):
+                manager = MagicMock()
+                self.configure_manager_mock(manager)
+                manager.get_containers.return_value = [MagicMock(id=f"container-{slot_id}")]
+                slots.append(
+                    WorkerSlot(
+                        slot_id=slot_id,
+                        container_manager=manager,
+                        docker_client=MagicMock(),
+                        circuit_breaker=SlotCircuitBreaker(),
+                        cache_dir=base_dir / f"slot-{slot_id}",
+                    )
+                )
+
+            with (
+                patch("src.parallel.create_worker_slots", return_value=slots),
+                patch("src.parallel.teardown_worker_slots"),
+                patch(
+                    "src.execution.parallel.run_single_episode",
+                    side_effect=fake_run_single_episode,
+                ),
+                patch(
+                    "src.execution.parallel._scoped_parallel_logging",
+                    return_value=nullcontext(),
+                ),
+            ):
+                run_generation_parallel(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                    task=task,
+                )
+
+        self.assertEqual(rollover_observed_slow_finished, [True])
+
+    def test_parallel_disabled_saturation_does_not_snapshot(self) -> None:
+        with TemporaryDirectory() as temp_dir:
+            base_dir = Path(temp_dir)
+            (base_dir / "compose").mkdir()
+            config = self.make_config(
+                base_dir,
+                parallel_episodes=1,
+                target_training_rows=100,
+                max_episodes=1,
+            )
+            task = self.make_task()
+            task.saturation_enabled.return_value = False
+            task.evaluate_saturation.side_effect = AssertionError(
+                "disabled saturation should not evaluate"
+            )
+            manager = MagicMock()
+            self.configure_manager_mock(manager)
+            manager.get_containers.return_value = [MagicMock(id="container-0")]
+            slots = [
+                WorkerSlot(
+                    slot_id=0,
+                    container_manager=manager,
+                    docker_client=MagicMock(),
+                    circuit_breaker=SlotCircuitBreaker(),
+                    cache_dir=base_dir / "slot-0",
+                )
+            ]
+
+            with (
+                patch("src.parallel.create_worker_slots", return_value=slots),
+                patch("src.parallel.teardown_worker_slots"),
+                patch(
+                    "src.execution.parallel.run_single_episode",
+                    return_value=self.make_episode(0, row_count=0, success=False),
+                ),
+                patch(
+                    "src.execution.parallel._scoped_parallel_logging",
+                    return_value=nullcontext(),
+                ),
+                patch(
+                    "src.parallel.ThreadSafeGenerationCollector.snapshot",
+                    side_effect=AssertionError("disabled saturation should not snapshot"),
+                ) as snapshot_mock,
+            ):
+                run_generation_parallel(
+                    genner=MagicMock(),
+                    docker_client=MagicMock(),
+                    config=config,
+                    generation_id=0,
+                    run_id="run-123",
+                    task=task,
+                )
+
+        snapshot_mock.assert_not_called()
+        task.evaluate_saturation.assert_not_called()
 
     def test_run_generation_parallel_releases_endpoint_lease_on_exception(self) -> None:
         from src.backend.endpoint_pool import EndpointPool, EndpointState

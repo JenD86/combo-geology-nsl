@@ -20,7 +20,6 @@ from tasks.feature_hypothesis_kazakhstan import FeatureHypothesisKazakhstanTask
 
 _GATE = FeatureHypothesisKazakhstanTask._should_persist_to_kg
 
-
 class TestStageCompletedAllowlist:
     def test_legacy_stage_2_completed_admits(self) -> None:
         assert _GATE(
@@ -421,3 +420,85 @@ class TestSeedPhaseHardening:
         assert FeatureHypothesisKazakhstanTask._seed_phase_admission_ok(
             self._healthy_seed(), seed_phase=True
         ) is True
+
+    def test_low_voxel_founder_seed_rejected(self) -> None:
+        # gen3-kz deadlock (2026-07-03): a 2-voxel founder was admitted
+        # first_layer_auto and, being cross-only, poisoned the pool (n_eff=0 for
+        # every later candidate). A founder below the min fill-fraction floor is
+        # not a viable cross-lift target and is rejected as a seed. 6.25e-6 == the
+        # live 2-voxel blob's fill of a 200x200x8 grid.
+        record = self._healthy_seed()
+        record["candidate_nonzero_voxels"] = 2
+        record["candidate_fill_fraction"] = 6.25e-6
+        assert FeatureHypothesisKazakhstanTask._seed_phase_admission_ok(
+            record, seed_phase=True
+        ) is False
+        assert record["first_root_rejection_reason"] == "degenerate_low_voxel_founder"
+
+    def test_substantial_founder_seed_admits(self) -> None:
+        record = self._healthy_seed()
+        record["candidate_nonzero_voxels"] = 5000
+        record["candidate_fill_fraction"] = 0.05
+        assert FeatureHypothesisKazakhstanTask._seed_phase_admission_ok(
+            record, seed_phase=True
+        ) is True
+        assert record["first_root_rejection_reason"] == "none"
+
+    def test_low_voxel_founder_is_noop_in_crossbreed(self) -> None:
+        # Outside survey the floor is telemetry only — the scorer governs.
+        record = self._healthy_seed()
+        record["candidate_fill_fraction"] = 6.25e-6
+        assert FeatureHypothesisKazakhstanTask._seed_phase_admission_ok(
+            record, seed_phase=False
+        ) is True
+
+
+class TestEmptinessVerdict:
+    """Approach B (2026-06-26): _stamp_candidate_triviality is the SINGLE source
+    of truth for the emptiness verdict (``emptiness_rejection_reason``), which
+    check_guards/``emptiness_passed`` reads on EVERY admission path.
+
+    A materialized all-zero layer that ran an op (``op_count>0``, e.g. a
+    ``set_layer_array`` of a grid the agent's code never populated — the
+    value-column-string-skip mode) carries no spatial signal and must be
+    rejected. It is distinct from a legitimate ``declared_nothing``
+    (``op_count==0``): the telemetry reason distinguishes the two so the
+    degenerate tool failure stays diagnosable.
+    """
+
+    @staticmethod
+    def _kg(op_count: int, geometry_kind_counts: dict | None = None) -> dict:
+        return {
+            "spatial_operation_provenance_count": op_count,
+            "coordinate_source_counts": {"artifact": op_count} if op_count else {},
+            "geometry_kind_counts": geometry_kind_counts or {},
+        }
+
+    def test_empty_array_op_layer_is_degenerate_empty(self) -> None:
+        # op_count=1 array op, all zeros — the live-bug shape.
+        kg = self._kg(1, {"array": 1})
+        kg["candidate_nonzero_voxels"] = 99  # stale scorer telemetry must not win
+        FeatureHypothesisKazakhstanTask._stamp_candidate_triviality(
+            kg, values=np.zeros((4, 4, 2), dtype=float)
+        )
+        assert kg["candidate_nonzero_voxels"] == 0
+        assert kg["emptiness_rejection_reason"] == "degenerate_empty_layer"
+        assert kg["declared_nothing"] is False  # ran an op → not declared_nothing
+
+    def test_declared_nothing_preserved(self) -> None:
+        # op_count=0, all zeros — the legitimate NSL negative; still rejected by
+        # the emptiness gate but tagged with its own reason.
+        kg = self._kg(0)
+        FeatureHypothesisKazakhstanTask._stamp_candidate_triviality(
+            kg, values=np.zeros((4, 4, 2), dtype=float)
+        )
+        assert kg["declared_nothing"] is True
+        assert kg["emptiness_rejection_reason"] == "declared_nothing"
+
+    def test_nonempty_array_op_layer_passes_emptiness(self) -> None:
+        kg = self._kg(1, {"array": 1})
+        values = np.zeros((4, 4, 2), dtype=float)
+        values[1:3, 1:3, 0] = 0.7
+        FeatureHypothesisKazakhstanTask._stamp_candidate_triviality(kg, values=values)
+        assert kg["emptiness_rejection_reason"] == "none"
+        assert kg["declared_nothing"] is False

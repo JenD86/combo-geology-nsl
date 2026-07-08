@@ -24,10 +24,13 @@ import json
 import math
 import os
 import re
+import shutil
+import threading
 import time
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterator
 
@@ -35,7 +38,13 @@ from docker.models.containers import Container
 from loguru import logger
 
 from src.container import container_to_service
-from src.task.base import TaskEnvironmentError, TaskSpec
+from src.task.base import (
+    SaturationDecision,
+    SaturationOutcome,
+    TaskEnvironmentError,
+    TaskSpec,
+)
+from src.task.saturation import evaluate_saturation_conditions
 from src.task.types import (
     BudgetConstraints,
     Capability,
@@ -223,8 +232,9 @@ report evidence.
 **Tabular geochemistry (CSV) — /workspace/input/amalgamated_csvs/:**
 - geochemDrillhole.csv: 1,297 drillhole assay rows. Columns: longitude, latitude,
   maxdepth_drill (per-HOLE depth in metres — there is NO per-sample depth),
-  holeid_drill, collarid, holetype, tenement, plus 80+ element assays: au_ppm,
-  as_ppm, sb_ppm, w_ppm, ag_ppm, cu_ppm, pb_ppm, zn_ppm, … (selected_element=au_ppm).
+  holeid_drill, collarid, holetype, tenement, plus 80+ multi-element assay columns
+  (e.g. au_ppm, cu_ppm, ni_ppm, zn_ppm, pb_ppm, as_ppm, fe_ppm, …). Choose the
+  element(s) relevant to your hypothesis.
 - geochemSurface.csv: 3,711 surface samples (SOIL + ROCKCHIP) with the same
   multi-element columns at surface coordinates.
 - minedex.csv: 21 recorded mineral occurrences/mines with listed material, type,
@@ -2493,7 +2503,40 @@ class FeatureHypothesisAustraliaTask(TaskSpec[FeatureHypothesisAustraliaState]):
     metric_unit = "nats"
     higher_is_better = False  # Lower BIC is better
     agent_service_name = "agent"
-    
+
+    @staticmethod
+    def _config_bool(value: Any, default: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            lowered = value.strip().lower()
+            if lowered in {"1", "true", "yes", "on"}:
+                return True
+            if lowered in {"0", "false", "no", "off"}:
+                return False
+        return default
+
+    @staticmethod
+    def _config_int(value: Any, default: int, *, minimum: int = 0) -> int:
+        try:
+            parsed = int(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(minimum, parsed)
+
+    @staticmethod
+    def _config_float(
+        value: Any,
+        default: float,
+        *,
+        minimum: float = 0.0,
+    ) -> float:
+        try:
+            parsed = float(value)
+        except (TypeError, ValueError):
+            parsed = default
+        return max(minimum, parsed)
+
     def __init__(self, task_config: dict[str, Any]) -> None:
         repo_root = Path(__file__).resolve().parent.parent
         
@@ -2527,6 +2570,46 @@ class FeatureHypothesisAustraliaTask(TaskSpec[FeatureHypothesisAustraliaState]):
         # until the pool is deep enough that greedy/crossbreed start from a rich
         # basis rather than ~4 layers. See list_variations / the greedy gate.
         self._min_features = int(task_config.get("min_features", 0))
+
+        self._saturation_enabled = self._config_bool(
+            task_config.get("saturation_enabled", False),
+            False,
+        )
+        self._saturation_min_episodes = self._config_int(
+            task_config.get("saturation_min_episodes", 50),
+            50,
+        )
+        self._saturation_success_rate_floor = self._config_float(
+            task_config.get("saturation_success_rate_floor", 0.10),
+            0.10,
+        )
+        self._saturation_plateau_bursts = self._config_int(
+            task_config.get("saturation_plateau_bursts", 2),
+            2,
+            minimum=2,
+        )
+        self._saturation_max_rollovers = self._config_int(
+            task_config.get("saturation_max_rollovers", 3),
+            3,
+        )
+        self._saturation_epoch_progress_admissions = self._config_int(
+            task_config.get("saturation_epoch_progress_admissions", 1),
+            1,
+        )
+        self._saturation_archive_keep_last = self._config_int(
+            task_config.get("saturation_archive_keep_last", 3),
+            3,
+            minimum=1,
+        )
+        self._saturation_archive_dir = Path(
+            task_config.get(
+                "saturation_archive_dir",
+                self._kg_dir.parent / "saturation_archives",
+            )
+        ).resolve()
+        self._saturation_epoch_start_count = 0
+        self._saturation_consecutive_unproductive_rollovers = 0
+        self._saturation_lock = threading.Lock()
 
         self._docker_compose_dir = task_config.get(
             "docker_compose_dir", "docker/feature-hypothesis-australia-compose"
@@ -2586,7 +2669,176 @@ class FeatureHypothesisAustraliaTask(TaskSpec[FeatureHypothesisAustraliaState]):
                 min_features=self._min_features,
             ),
         ]
-    
+
+    @staticmethod
+    def _episode_admitted_to_kg(episode: Any) -> bool:
+        breakdown = getattr(episode, "task_breakdown", None) or {}
+        if not isinstance(breakdown, dict):
+            return False
+        return any(
+            bool(breakdown.get(key))
+            for key in (
+                "kg_admission_passed",
+                "layer_admitted_to_kg",
+                "admitted_to_kg_forced_success",
+            )
+        )
+
+    @classmethod
+    def _count_kg_admissions(cls, episodes: list[Any]) -> int:
+        return sum(1 for episode in episodes if cls._episode_admitted_to_kg(episode))
+
+    def saturation_enabled(self) -> bool:
+        return bool(self._saturation_enabled)
+
+    def generation_checkpoint_state(self) -> dict[str, Any] | None:
+        if not self._saturation_enabled:
+            return None
+        with self._saturation_lock:
+            return {
+                "saturation_epoch_start_count": self._saturation_epoch_start_count,
+                "saturation_consecutive_unproductive_rollovers": (
+                    self._saturation_consecutive_unproductive_rollovers
+                ),
+            }
+
+    def load_generation_checkpoint_state(self, state: dict[str, Any] | None) -> None:
+        if not isinstance(state, dict):
+            return
+        with self._saturation_lock:
+            self._saturation_epoch_start_count = max(
+                0,
+                int(state.get("saturation_epoch_start_count", 0)),
+            )
+            self._saturation_consecutive_unproductive_rollovers = max(
+                0,
+                int(state.get("saturation_consecutive_unproductive_rollovers", 0)),
+            )
+
+    def _prune_saturation_archives(self) -> None:
+        if not self._saturation_archive_dir.exists():
+            return
+        archives = sorted(
+            (
+                path
+                for path in self._saturation_archive_dir.glob(
+                    "australia-coe-fairbairn-*"
+                )
+                if path.is_dir()
+            ),
+            key=lambda path: path.name,
+        )
+        overflow = len(archives) - self._saturation_archive_keep_last
+        if overflow <= 0:
+            return
+        for archive in archives[:overflow]:
+            shutil.rmtree(archive)
+
+    def evaluate_saturation(self, generation_data: Any) -> SaturationOutcome:
+        with self._saturation_lock:
+            if not self._saturation_enabled:
+                return SaturationOutcome(SaturationDecision.CONTINUE)
+            epoch_start_count = self._saturation_epoch_start_count
+            consecutive_unproductive = (
+                self._saturation_consecutive_unproductive_rollovers
+            )
+
+        all_episodes = list(getattr(generation_data, "all_episodes", []))
+        epoch_start_count = min(max(0, epoch_start_count), len(all_episodes))
+        epoch_episodes = all_episodes[epoch_start_count:]
+        if len(epoch_episodes) < self._saturation_min_episodes:
+            return SaturationOutcome(SaturationDecision.CONTINUE)
+
+        interweave_remaining = 0
+        try:
+            interweave_remaining = int(
+                self._read_interweave_state(self._kg_dir / "coe_fairbairn").get(
+                    "interweave_survey_remaining",
+                    0,
+                )
+            )
+        except Exception:  # noqa: BLE001
+            interweave_remaining = 0
+
+        check = evaluate_saturation_conditions(
+            epoch_episodes,
+            enabled=True,
+            min_episodes=self._saturation_min_episodes,
+            success_rate_floor=self._saturation_success_rate_floor,
+            plateau_bursts=self._saturation_plateau_bursts,
+            interweave_survey_remaining=interweave_remaining,
+        )
+        if not check.tripped:
+            return SaturationOutcome(SaturationDecision.CONTINUE)
+
+        admissions_added = self._count_kg_admissions(epoch_episodes)
+        next_unproductive = (
+            consecutive_unproductive + 1
+            if admissions_added < self._saturation_epoch_progress_admissions
+            else 0
+        )
+        if next_unproductive >= self._saturation_max_rollovers:
+            return SaturationOutcome(
+                SaturationDecision.STOP,
+                "saturation_exhausted",
+            )
+        return SaturationOutcome(
+            SaturationDecision.ROLLOVER,
+            check.reason or "saturation",
+        )
+
+    def rollover_knowledge_graph(
+        self,
+        reason_tag: str,
+        generation_data: Any,
+        *,
+        rolled_at: str | None = None,
+    ) -> None:
+        with self._saturation_lock:
+            all_episodes = list(getattr(generation_data, "all_episodes", []))
+            epoch_start_count = min(
+                max(0, self._saturation_epoch_start_count),
+                len(all_episodes),
+            )
+            epoch_episodes = all_episodes[epoch_start_count:]
+            kg_active = self._kg_dir / "coe_fairbairn"
+            store_active = self._store_dir / "coe_fairbairn"
+            stamp_source = rolled_at or datetime.now().isoformat(timespec="seconds")
+            stamp = _safe_artifact_component(stamp_source)
+            reason_component = _safe_artifact_component(reason_tag)[:80]
+            archive_dest = (
+                self._saturation_archive_dir
+                / f"australia-coe-fairbairn-{stamp}-{reason_component}"
+            )
+            if archive_dest.exists():
+                archive_dest = archive_dest.with_name(
+                    f"{archive_dest.name}-{uuid.uuid4().hex[:8]}"
+                )
+            archive_dest.mkdir(parents=True, exist_ok=False)
+
+            for src, name in (
+                (store_active, "store_coe_fairbairn"),
+                (kg_active, "knowledge_coe_fairbairn"),
+            ):
+                if src.exists():
+                    shutil.move(str(src), str(archive_dest / name))
+
+            (store_active / "admitted" / "layers").mkdir(parents=True, exist_ok=True)
+            (store_active / "scratch").mkdir(parents=True, exist_ok=True)
+            kg_active.mkdir(parents=True, exist_ok=True)
+
+            admissions_added = self._count_kg_admissions(epoch_episodes)
+            if admissions_added < self._saturation_epoch_progress_admissions:
+                self._saturation_consecutive_unproductive_rollovers += 1
+            else:
+                self._saturation_consecutive_unproductive_rollovers = 0
+            self._saturation_epoch_start_count = len(all_episodes)
+            self._prune_saturation_archives()
+            logger.info(
+                "feature_hypothesis_australia: archived saturated KG to "
+                f"{archive_dest} and started a fresh KG epoch"
+            )
+
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
@@ -3793,13 +4045,14 @@ except Exception as user_code_error:
                 "count": 1297,
                 "columns": [
                     "tenement", "longitude", "latitude", "maxdepth_drill",
-                    "holeid_drill", "collarid", "holetype", "selected_element",
-                    "au_ppm", "as_ppm", "sb_ppm", "w_ppm", "bi_ppm", "te_ppm",
-                    "ag_ppm", "cu_ppm", "pb_ppm", "zn_ppm", "mo_ppm",
+                    "holeid_drill", "collarid", "holetype",
+                    "au_ppm", "cu_ppm", "ni_ppm", "zn_ppm", "pb_ppm", "as_ppm",
+                    "ag_ppm", "fe_ppm", "mn_ppm", "cr_ppm", "co_ppm",
                     "(+60 more *_ppm element assays)",
                 ],
                 "note": (
-                    "1,297 drillhole assay rows across 4 tenements; selected_element=au_ppm. "
+                    "1,297 drillhole assay rows across 4 tenements with 80+ *_ppm "
+                    "multi-element assays; choose the element(s) relevant to your hypothesis. "
                     "Coordinates are WGS84 longitude/latitude (degrees). maxdepth_drill is the "
                     "per-HOLE bottom depth in metres — there is NO per-sample depth, so treat a "
                     "sample as near-surface or use maxdepth_drill for depth_m. Use "
@@ -3814,9 +4067,9 @@ except Exception as user_code_error:
                 "count": 3711,
                 "columns": [
                     "tenement", "longitude", "latitude", "surfacesampleid",
-                    "surfacesampletype", "selected_element",
-                    "au_ppm", "as_ppm", "sb_ppm", "w_ppm", "ag_ppm", "cu_ppm",
-                    "pb_ppm", "zn_ppm", "(+ more *_ppm element assays)",
+                    "surfacesampletype",
+                    "au_ppm", "cu_ppm", "ni_ppm", "zn_ppm", "pb_ppm", "as_ppm",
+                    "ag_ppm", "fe_ppm", "(+ more *_ppm element assays)",
                 ],
                 "note": (
                     "3,711 surface samples (SOIL + ROCKCHIP) with the same element columns at "
@@ -7480,6 +7733,17 @@ finally:
         ):
             reasons.append("degenerate_fill")
 
+        # gen3-kz deadlock parity (2026-07-03): a LOW-but-nonzero founder (below the
+        # min fill-fraction floor) is not a viable cross-lift target.
+        # degenerate_empty only catches fill==0 and degenerate_fill only the
+        # full-constant blob, so a near-empty blob (e.g. 2 voxels) slips both —
+        # reject it on its own floor so a cross-only pool can never be poisoned by a
+        # point-blob founder.
+        from voxel_features.scoring import _SPATIAL_MIN_FOUNDER_FILL_FRACTION
+
+        if 0.0 < fill_fraction < _SPATIAL_MIN_FOUNDER_FILL_FRACTION:
+            reasons.append("degenerate_low_voxel_founder")
+
         kg_record["first_root_rejection_reason"] = reasons[0] if reasons else "none"
         return not reasons
 
@@ -7555,11 +7819,32 @@ finally:
         if not isinstance(geometry_kind_counts, dict):
             geometry_kind_counts = {}
         array_op_count = int(geometry_kind_counts.get("array", 0) or 0)
-        nonzero = int(kg_record.get("candidate_nonzero_voxels", np.count_nonzero(candidate)) or 0)
+        nonzero = int(np.count_nonzero(candidate))
         declared_footprint_size = nonzero if nonzero > 0 else op_count
+        # Emptiness, the single source of truth (read by check_guards/emptiness_passed
+        # on EVERY admission path — survey AND crossbreed). A materialized layer with
+        # zero nonzero voxels carries no spatial signal, period. Two distinct empty
+        # cases, kept separate for telemetry:
+        #   * declared_nothing (op_count == 0): the agent ran no op — a legitimate
+        #     NSL negative-space declaration (not admitted to the KG, but not a bug).
+        #   * degenerate_empty_layer (op_count > 0): the agent ran an op that produced
+        #     nothing (e.g. a set_layer_array of a grid the code never populated, or a
+        #     value_column-string skip that filtered out every record). This slipped
+        #     the gate: declared_nothing required op_count == 0, and the seed floor's
+        #     single_spatial_operation excludes array ops. Ported from the KZ zero-voxel
+        #     fix (2026-06-26). NOTE: the degenerate_fill (full-constant blob) check
+        #     stays in _seed_phase_admission_ok and is DELIBERATELY Australia-only.
         declared_nothing = op_count == 0 and nonzero == 0
+        degenerate_empty = op_count > 0 and nonzero == 0
+        if declared_nothing:
+            emptiness_rejection_reason = "declared_nothing"
+        elif degenerate_empty:
+            emptiness_rejection_reason = "degenerate_empty_layer"
+        else:
+            emptiness_rejection_reason = "none"
 
         kg_record.update({
+            "candidate_nonzero_voxels": nonzero,
             "candidate_unique_nonzero_values": int(unique_nonzero.size),
             "candidate_nonzero_value_min": value_min,
             "candidate_nonzero_value_max": value_max,
@@ -7570,7 +7855,7 @@ finally:
             "depth_levels_filled": depth_levels_filled,
             "declared_footprint_size": int(declared_footprint_size),
             "declared_nothing": declared_nothing,
-            "emptiness_rejection_reason": "declared_nothing" if declared_nothing else "none",
+            "emptiness_rejection_reason": emptiness_rejection_reason,
         })
 
     @classmethod
@@ -8048,7 +8333,12 @@ finally:
                     admitted_dir=admitted_dir,
                 )
                 self._stamp_candidate_triviality(kg_record, values=candidate_values)
-                emptiness_passed = not bool(kg_record.get("declared_nothing", False))
+                # _stamp_candidate_triviality owns the emptiness verdict; reject any
+                # zero-voxel layer (declared_nothing OR a degenerate op-produced-nothing
+                # layer) regardless of op_count — not just the op_count==0 case.
+                emptiness_passed = (
+                    str(kg_record.get("emptiness_rejection_reason", "none")) == "none"
+                )
                 # Survey-phase admits seed the KG: hold them to a geometry/
                 # provenance floor (override-proof against creative_fallback;
                 # reject the single-op central blob that drives co-location
